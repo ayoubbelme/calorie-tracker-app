@@ -55,6 +55,11 @@ export function CaloriesProvider({ children }) {
                 date: key,
             };
 
+            // Preserve weight if it exists
+            if (existing.weight) {
+                parsed[key].weight = existing.weight;
+            }
+
             await AsyncStorage.setItem('macro_history', JSON.stringify(parsed));
             setHistory({ ...parsed }); // Re-derive triggers automatic reset if day changed
         } catch (e) {
@@ -62,10 +67,39 @@ export function CaloriesProvider({ children }) {
         }
     };
 
+    // ✅ NEW: Update weight for a specific date (defaults to today)
+    const updateWeight = async (weight, date = null) => {
+        try {
+            const key = date || getTodayKey();
+
+            // Read fresh from storage
+            const stored = await AsyncStorage.getItem('macro_history');
+            const parsed = stored ? JSON.parse(stored) : {};
+
+            const existing = parsed[key] || { calories: 0, protein: 0, carbs: 0, fat: 0 };
+
+            parsed[key] = {
+                ...existing,
+                weight: parseFloat(weight),
+                date: key,
+            };
+
+            await AsyncStorage.setItem('macro_history', JSON.stringify(parsed));
+            setHistory({ ...parsed });
+        } catch (e) {
+            console.error('Failed to save weight', e);
+        }
+    };
+
     return (
         <CaloriesContext.Provider value={{
-            todayCalories, todayProtein, todayCarbs, todayFat,
-            addMeal, history,
+            todayCalories,
+            todayProtein,
+            todayCarbs,
+            todayFat,
+            addMeal,
+            updateWeight, // ✅ Export the new function
+            history,
         }}>
             {children}
         </CaloriesContext.Provider>

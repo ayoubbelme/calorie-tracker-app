@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
     View, Text, TextInput, TouchableOpacity, StyleSheet,
-    ScrollView, KeyboardAvoidingView, Platform, Alert, Modal,
+    ScrollView, KeyboardAvoidingView, Platform, Alert, Modal, AppState,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useTheme } from '../components/ThemeContext';
 
 const getTodayKey = () => {
     const d = new Date();
@@ -13,13 +14,19 @@ const getTodayKey = () => {
     const day = String(d.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
 };
+
 const formatDuration = (seconds) => {
-    const m = Math.floor(seconds / 60);
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
     return `${m}m ${s}s`;
 };
 
 export default function WorkoutScreen() {
+    const { theme } = useTheme();
+    const styles = createStyles(theme);
+
     const [exercise, setExercise] = useState('');
     const [currentSets, setCurrentSets] = useState([]);
     const [currentReps, setCurrentReps] = useState('');
@@ -28,20 +35,57 @@ export default function WorkoutScreen() {
     const [previousWorkouts, setPreviousWorkouts] = useState([]);
     const [showPrevious, setShowPrevious] = useState(false);
     const [previousDate, setPreviousDate] = useState('');
-
-    // Session timer
     const [sessionActive, setSessionActive] = useState(false);
     const [sessionSeconds, setSessionSeconds] = useState(0);
     const [sessionStartTime, setSessionStartTime] = useState(null);
-    const timerRef = useRef(null);
-
-    // Summary modal
     const [showSummary, setShowSummary] = useState(false);
     const [summaryData, setSummaryData] = useState(null);
-
-    // PR history (all-time best per exercise)
     const [prHistory, setPrHistory] = useState({});
 
+    const timerRef = useRef(null);
+    const appStateRef = useRef(AppState.currentState);
+
+    // ── Recalculate elapsed time from stored startTime ────────────────────────
+    const recalcSeconds = (startTimeISO) => {
+        if (!startTimeISO) return 0;
+        return Math.floor((Date.now() - new Date(startTimeISO).getTime()) / 1000);
+    };
+
+    // ── Start the interval ticker ─────────────────────────────────────────────
+    const startTicker = () => {
+        clearInterval(timerRef.current);
+        timerRef.current = setInterval(() => {
+            setSessionSeconds(prev => prev + 1);
+        }, 1000);
+    };
+
+    // ── AppState listener: recalc elapsed when app comes back to foreground ───
+    useEffect(() => {
+        const subscription = AppState.addEventListener('change', (nextState) => {
+            if (
+                appStateRef.current.match(/inactive|background/) &&
+                nextState === 'active'
+            ) {
+                // App came back to foreground — resync timer from stored startTime
+                AsyncStorage.getItem('workout_sessions').then((stored) => {
+                    if (!stored) return;
+                    const history = JSON.parse(stored);
+                    const todayKey = getTodayKey();
+                    const session = history[todayKey];
+                    if (session && !session.finished && session.startTime) {
+                        const elapsed = recalcSeconds(session.startTime);
+                        setSessionSeconds(elapsed);
+                        startTicker();
+                    }
+                });
+            }
+            appStateRef.current = nextState;
+        });
+
+        return () => subscription.remove();
+    }, []);
+
+    // ── Load session on mount ─────────────────────────────────────────────────
     useEffect(() => {
         const load = async () => {
             try {
@@ -50,15 +94,17 @@ export default function WorkoutScreen() {
                 const todayKey = getTodayKey();
 
                 if (history[todayKey] && !history[todayKey].finished) {
-                    setWorkouts(history[todayKey].exercises || []);
+                    const session = history[todayKey];
+                    setWorkouts(session.exercises || []);
                     setSessionActive(true);
-                    const start = new Date(history[todayKey].startTime);
-                    setSessionStartTime(start);
-                    const elapsed = Math.floor((Date.now() - start.getTime()) / 1000);
+                    setSessionStartTime(new Date(session.startTime));
+
+                    // Always recalc from real start time — works even if app was killed
+                    const elapsed = recalcSeconds(session.startTime);
                     setSessionSeconds(elapsed);
+                    startTicker();
                 }
 
-                // Find last finished session
                 const keys = Object.keys(history)
                     .filter(k => k !== todayKey && history[k].finished)
                     .sort().reverse();
@@ -67,16 +113,14 @@ export default function WorkoutScreen() {
                     setPreviousDate(keys[0]);
                 }
 
-                // Build PR history from all sessions
+                // Build PR history
                 const prs = {};
                 Object.values(history).forEach(session => {
                     (session.exercises || []).forEach(ex => {
                         ex.sets.forEach(s => {
                             if (s.weight) {
                                 const w = parseFloat(s.weight);
-                                if (!prs[ex.exercise] || w > prs[ex.exercise]) {
-                                    prs[ex.exercise] = w;
-                                }
+                                if (!prs[ex.exercise] || w > prs[ex.exercise]) prs[ex.exercise] = w;
                             }
                         });
                     });
@@ -87,28 +131,21 @@ export default function WorkoutScreen() {
             }
         };
         load();
+
+        return () => clearInterval(timerRef.current);
     }, []);
 
-    // Timer
+    // ── Session start/stop controls the ticker ────────────────────────────────
     useEffect(() => {
         if (sessionActive) {
-            timerRef.current = setInterval(() => {
-                setSessionSeconds(prev => prev + 1);
-            }, 1000);
+            startTicker();
         } else {
             clearInterval(timerRef.current);
         }
         return () => clearInterval(timerRef.current);
     }, [sessionActive]);
 
-    const startSession = () => {
-        const now = new Date();
-        setSessionStartTime(now);
-        setSessionActive(true);
-        setSessionSeconds(0);
-        saveSessionToStorage([], now, false);
-    };
-
+    // ── Storage helpers ───────────────────────────────────────────────────────
     const saveSessionToStorage = async (exercises, startTime, finished, summary = null) => {
         try {
             const stored = await AsyncStorage.getItem('workout_sessions');
@@ -127,27 +164,27 @@ export default function WorkoutScreen() {
         }
     };
 
+    // ── Session actions ───────────────────────────────────────────────────────
+    const startSession = async () => {
+        const now = new Date();
+        setSessionStartTime(now);
+        setSessionActive(true);
+        setSessionSeconds(0);
+        await saveSessionToStorage([], now, false);
+    };
+
     const addSet = () => {
         if (!currentReps) return;
-        setCurrentSets([...currentSets, {
-            reps: currentReps,
-            weight: currentWeight || null,
-        }]);
+        setCurrentSets([...currentSets, { reps: currentReps, weight: currentWeight || null }]);
         setCurrentReps('');
         setCurrentWeight('');
     };
 
-    const removeSet = (index) => {
-        setCurrentSets(currentSets.filter((_, i) => i !== index));
-    };
+    const removeSet = (index) => setCurrentSets(currentSets.filter((_, i) => i !== index));
 
     const saveExercise = () => {
         if (!exercise || currentSets.length === 0) return;
-        const newWorkout = {
-            id: Date.now().toString(),
-            exercise,
-            sets: currentSets,
-        };
+        const newWorkout = { id: Date.now().toString(), exercise, sets: currentSets };
         const updated = [newWorkout, ...workouts];
         setWorkouts(updated);
         saveSessionToStorage(updated, sessionStartTime, false);
@@ -170,7 +207,7 @@ export default function WorkoutScreen() {
         ]);
     };
 
-    const loadFromPrevious = (prev) => {
+    const loadFromPreviousAll = (prev) => {
         setExercise(prev.exercise);
         setCurrentSets(prev.sets.map(s => ({ reps: s.reps, weight: s.weight })));
         setShowPrevious(false);
@@ -181,7 +218,6 @@ export default function WorkoutScreen() {
             Alert.alert('No exercises', 'Add at least one exercise before finishing.');
             return;
         }
-
         Alert.alert('Finish Workout?', 'This will save your session.', [
             { text: 'Cancel', style: 'cancel' },
             {
@@ -189,27 +225,27 @@ export default function WorkoutScreen() {
                     setSessionActive(false);
                     clearInterval(timerRef.current);
 
-                    // Calculate volume
                     const totalVolume = workouts.reduce((acc, w) =>
                         acc + w.sets.reduce((a, s) =>
                             a + (parseInt(s.reps) * (parseFloat(s.weight) || 1)), 0), 0);
 
-                    // Detect PRs
                     const newPRs = [];
                     workouts.forEach(w => {
-                        const maxWeight = Math.max(...w.sets
-                            .filter(s => s.weight)
-                            .map(s => parseFloat(s.weight)), 0);
-                        if (maxWeight > 0) {
-                            const prevBest = prHistory[w.exercise] || 0;
-                            if (maxWeight > prevBest) {
-                                newPRs.push({ exercise: w.exercise, weight: maxWeight });
-                            }
+                        const maxWeight = Math.max(
+                            ...w.sets.filter(s => s.weight).map(s => parseFloat(s.weight)), 0
+                        );
+                        if (maxWeight > 0 && maxWeight > (prHistory[w.exercise] || 0)) {
+                            newPRs.push({ exercise: w.exercise, weight: maxWeight });
                         }
                     });
 
+                    // Use real elapsed time from startTime for accuracy
+                    const finalDuration = sessionStartTime
+                        ? recalcSeconds(sessionStartTime.toISOString())
+                        : sessionSeconds;
+
                     const summary = {
-                        duration: sessionSeconds,
+                        duration: finalDuration,
                         totalVolume: Math.round(totalVolume),
                         totalExercises: workouts.length,
                         totalSets: workouts.reduce((a, w) => a + w.sets.length, 0),
@@ -221,7 +257,6 @@ export default function WorkoutScreen() {
                     setShowSummary(true);
                     saveSessionToStorage(workouts, sessionStartTime, true, summary);
 
-                    // Update PR history
                     const updatedPRs = { ...prHistory };
                     newPRs.forEach(pr => { updatedPRs[pr.exercise] = pr.weight; });
                     setPrHistory(updatedPRs);
@@ -238,20 +273,17 @@ export default function WorkoutScreen() {
         setSummaryData(null);
     };
 
-    const loadFromPreviousAll = (prev) => {
-        setExercise(prev.exercise);
-        setCurrentSets(prev.sets.map(s => ({ reps: s.reps, weight: s.weight })));
-        setShowPrevious(false);
-    };
-
+    // ── Derived stats ─────────────────────────────────────────────────────────
     const totalSets = workouts.reduce((acc, w) => acc + w.sets.length, 0);
-    const totalReps = workouts.reduce((acc, w) => acc + w.sets.reduce((a, s) => a + parseInt(s.reps), 0), 0);
+    const totalReps = workouts.reduce((acc, w) =>
+        acc + w.sets.reduce((a, s) => a + parseInt(s.reps), 0), 0);
 
     const formatDate = (dateStr) => {
         const d = new Date(dateStr);
         return d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
     };
 
+    // ── Render ────────────────────────────────────────────────────────────────
     return (
         <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : null}
@@ -267,7 +299,9 @@ export default function WorkoutScreen() {
 
                         <View style={styles.summaryGrid}>
                             <View style={styles.summaryCell}>
-                                <Text style={styles.summaryCellValue}>{formatDuration(summaryData?.duration || 0)}</Text>
+                                <Text style={styles.summaryCellValue}>
+                                    {formatDuration(summaryData?.duration || 0)}
+                                </Text>
                                 <Text style={styles.summaryCellLabel}>Duration</Text>
                             </View>
                             <View style={styles.summaryCellDivider} />
@@ -284,7 +318,9 @@ export default function WorkoutScreen() {
 
                         <View style={styles.volumeBox}>
                             <Text style={styles.volumeLabel}>Total Volume</Text>
-                            <Text style={styles.volumeValue}>{summaryData?.totalVolume?.toLocaleString()} kg</Text>
+                            <Text style={styles.volumeValue}>
+                                {summaryData?.totalVolume?.toLocaleString()} kg
+                            </Text>
                         </View>
 
                         {summaryData?.prs?.length > 0 && (
@@ -292,24 +328,34 @@ export default function WorkoutScreen() {
                                 <Text style={styles.prTitle}>🏆 New Personal Records!</Text>
                                 {summaryData.prs.map((pr, i) => (
                                     <View key={i} style={styles.prItem}>
-                                        <Ionicons name="trophy" size={14} color="#F59E0B" />
-                                        <Text style={styles.prText}>
-                                            {pr.exercise} — {pr.weight} kg
-                                        </Text>
+                                        <Ionicons name="trophy" size={14} color={theme.warning} />
+                                        <Text style={styles.prText}>{pr.exercise} — {pr.weight} kg</Text>
                                     </View>
                                 ))}
                             </View>
                         )}
 
-                        <TouchableOpacity style={styles.modalBtn} onPress={closeSummaryAndReset}>
-                            <Text style={styles.modalBtnText}>Done ✓</Text>
+                        <TouchableOpacity
+                            style={styles.modalBtn}
+                            activeOpacity={0.82}
+                            onPress={closeSummaryAndReset}
+                        >
+                            <View style={styles.modalBtnInner}>
+                                <View style={styles.modalBtnIconWrap}>
+                                    <Ionicons name="checkmark" size={15} color="#FFFFFF" />
+                                </View>
+                                <Text style={styles.modalBtnText}>Done</Text>
+                                <Ionicons name="arrow-forward" size={15} color="rgba(255,255,255,0.9)" />
+                            </View>
                         </TouchableOpacity>
                     </View>
                 </View>
             </Modal>
 
-            <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
-
+            <ScrollView
+                contentContainerStyle={styles.scroll}
+                showsVerticalScrollIndicator={false}
+            >
                 {/* Header */}
                 <View style={styles.header}>
                     <View>
@@ -318,7 +364,7 @@ export default function WorkoutScreen() {
                     </View>
                     {sessionActive ? (
                         <View style={styles.timerBadge}>
-                            <Ionicons name="time-outline" size={14} color="#fff" />
+                            <Ionicons name="time-outline" size={14} color="#FFFFFF" />
                             <Text style={styles.timerText}>{formatDuration(sessionSeconds)}</Text>
                         </View>
                     ) : (
@@ -331,9 +377,18 @@ export default function WorkoutScreen() {
 
                 {/* Start Session */}
                 {!sessionActive && (
-                    <TouchableOpacity style={styles.startBtn} onPress={startSession} activeOpacity={0.85}>
-                        <Ionicons name="play-circle-outline" size={22} color="#fff" />
-                        <Text style={styles.startBtnText}>Start Workout Session</Text>
+                    <TouchableOpacity
+                        style={styles.startBtn}
+                        onPress={startSession}
+                        activeOpacity={0.82}
+                    >
+                        <View style={styles.startBtnInner}>
+                            <View style={styles.startBtnIconWrap}>
+                                <Ionicons name="play" size={15} color="#FFFFFF" />
+                            </View>
+                            <Text style={styles.startBtnText}>Start Workout Session</Text>
+                            <Ionicons name="arrow-forward" size={15} color="rgba(255,255,255,0.9)" />
+                        </View>
                     </TouchableOpacity>
                 )}
 
@@ -365,7 +420,7 @@ export default function WorkoutScreen() {
                         activeOpacity={0.8}
                     >
                         <View style={styles.previousBannerLeft}>
-                            <Ionicons name="time-outline" size={18} color="#3B82F6" />
+                            <Ionicons name="time-outline" size={18} color={theme.info} />
                             <View style={{ marginLeft: 10 }}>
                                 <Text style={styles.previousBannerTitle}>Last Session</Text>
                                 <Text style={styles.previousBannerDate}>{formatDate(previousDate)}</Text>
@@ -373,14 +428,20 @@ export default function WorkoutScreen() {
                         </View>
                         <View style={styles.previousBannerRight}>
                             <Text style={styles.previousBannerCount}>{previousWorkouts.length} exercises</Text>
-                            <Ionicons name={showPrevious ? 'chevron-up' : 'chevron-down'} size={16} color="#3B82F6" />
+                            <Ionicons
+                                name={showPrevious ? 'chevron-up' : 'chevron-down'}
+                                size={16}
+                                color={theme.info}
+                            />
                         </View>
                     </TouchableOpacity>
                 )}
 
                 {showPrevious && (
                     <View style={styles.previousList}>
-                        <Text style={styles.previousListHint}>Tap to load into form — edit before saving</Text>
+                        <Text style={styles.previousListHint}>
+                            Tap to load into form — edit before saving
+                        </Text>
                         {previousWorkouts.map((prev, index) => (
                             <TouchableOpacity
                                 key={index}
@@ -391,13 +452,14 @@ export default function WorkoutScreen() {
                                 <View style={styles.previousItemLeft}>
                                     <Text style={styles.previousItemName}>{prev.exercise}</Text>
                                     <Text style={styles.previousItemMeta}>
-                                        {prev.sets.length} sets · {prev.sets.map(s =>
+                                        {prev.sets.length} sets ·{' '}
+                                        {prev.sets.map(s =>
                                             `${s.reps}${s.weight ? `×${s.weight}kg` : ' reps'}`
                                         ).join(', ')}
                                     </Text>
                                 </View>
                                 <View style={styles.loadBtn}>
-                                    <Ionicons name="arrow-redo-outline" size={16} color="#3B82F6" />
+                                    <Ionicons name="arrow-redo-outline" size={16} color={theme.info} />
                                     <Text style={styles.loadBtnText}>Load</Text>
                                 </View>
                             </TouchableOpacity>
@@ -405,14 +467,14 @@ export default function WorkoutScreen() {
                     </View>
                 )}
 
-                {/* Input Card — only when session active */}
+                {/* Input Card */}
                 {sessionActive && (
                     <View style={styles.inputCard}>
                         <Text style={styles.inputCardTitle}>Add Exercise</Text>
 
                         <TextInput
                             placeholder="Exercise name"
-                            placeholderTextColor="#6B7280"
+                            placeholderTextColor={theme.textTertiary}
                             style={styles.input}
                             value={exercise}
                             onChangeText={setExercise}
@@ -427,14 +489,22 @@ export default function WorkoutScreen() {
                                     <Text style={[styles.setsPreviewCol, { flex: 0.5 }]}> </Text>
                                 </View>
                                 {currentSets.map((s, i) => (
-                                    <View key={i} style={[styles.setsPreviewRow, i % 2 === 0 && styles.setsPreviewRowAlt]}>
+                                    <View
+                                        key={i}
+                                        style={[styles.setsPreviewRow, i % 2 === 0 && styles.setsPreviewRowAlt]}
+                                    >
                                         <View style={styles.setBadge}>
                                             <Text style={styles.setBadgeText}>{i + 1}</Text>
                                         </View>
                                         <Text style={styles.setsPreviewCell}>{s.reps}</Text>
-                                        <Text style={styles.setsPreviewCell}>{s.weight ? `${s.weight} kg` : '—'}</Text>
-                                        <TouchableOpacity onPress={() => removeSet(i)} style={{ flex: 0.5, alignItems: 'center' }}>
-                                            <Ionicons name="close-circle-outline" size={18} color="#EF4444" />
+                                        <Text style={styles.setsPreviewCell}>
+                                            {s.weight ? `${s.weight} kg` : '—'}
+                                        </Text>
+                                        <TouchableOpacity
+                                            onPress={() => removeSet(i)}
+                                            style={{ flex: 0.5, alignItems: 'center' }}
+                                        >
+                                            <Ionicons name="close-circle-outline" size={18} color={theme.error} />
                                         </TouchableOpacity>
                                     </View>
                                 ))}
@@ -448,7 +518,7 @@ export default function WorkoutScreen() {
                                 <TextInput
                                     placeholder="12"
                                     keyboardType="numeric"
-                                    placeholderTextColor="#6B7280"
+                                    placeholderTextColor={theme.textTertiary}
                                     style={styles.inputSmall}
                                     value={currentReps}
                                     onChangeText={setCurrentReps}
@@ -459,7 +529,7 @@ export default function WorkoutScreen() {
                                 <TextInput
                                     placeholder="60"
                                     keyboardType="numeric"
-                                    placeholderTextColor="#6B7280"
+                                    placeholderTextColor={theme.textTertiary}
                                     style={styles.inputSmall}
                                     value={currentWeight}
                                     onChangeText={setCurrentWeight}
@@ -468,22 +538,34 @@ export default function WorkoutScreen() {
                             <TouchableOpacity
                                 style={[styles.addSetBtn, !currentReps && styles.addSetBtnDisabled]}
                                 onPress={addSet}
-                                activeOpacity={0.8}
+                                activeOpacity={0.82}
                             >
-                                <Ionicons name="add" size={22} color="#fff" />
-                                <Text style={styles.addSetBtnText}>Add Set</Text>
+                                <View style={styles.addSetBtnInner}>
+                                    <View style={styles.addSetBtnIconWrap}>
+                                        <Ionicons name="add" size={14} color="#FFFFFF" />
+                                    </View>
+                                    <Text style={styles.addSetBtnText}>Add Set</Text>
+                                </View>
                             </TouchableOpacity>
                         </View>
 
                         <TouchableOpacity
-                            style={[styles.saveButton, (!exercise || currentSets.length === 0) && styles.saveButtonDisabled]}
+                            style={[
+                                styles.saveButton,
+                                (!exercise || currentSets.length === 0) && styles.saveButtonDisabled
+                            ]}
                             onPress={saveExercise}
-                            activeOpacity={0.8}
+                            activeOpacity={0.82}
                         >
-                            <Ionicons name="checkmark-circle-outline" size={20} color="#fff" />
-                            <Text style={styles.saveButtonText}>
-                                Save Exercise {currentSets.length > 0 ? `(${currentSets.length} sets)` : ''}
-                            </Text>
+                            <View style={styles.saveButtonInner}>
+                                <View style={styles.saveButtonIconWrap}>
+                                    <Ionicons name="checkmark" size={15} color="#FFFFFF" />
+                                </View>
+                                <Text style={styles.saveButtonText}>
+                                    Save Exercise {currentSets.length > 0 ? `(${currentSets.length} sets)` : ''}
+                                </Text>
+                                <Ionicons name="arrow-forward" size={15} color="rgba(255,255,255,0.9)" />
+                            </View>
                         </TouchableOpacity>
                     </View>
                 )}
@@ -499,8 +581,11 @@ export default function WorkoutScreen() {
                                         <Text style={styles.exerciseIndex}>{workouts.length - index}</Text>
                                     </View>
                                     <Text style={styles.exerciseName}>{item.exercise}</Text>
-                                    <TouchableOpacity onPress={() => deleteWorkout(item.id)} style={styles.deleteBtn}>
-                                        <Ionicons name="trash-outline" size={18} color="#EF4444" />
+                                    <TouchableOpacity
+                                        onPress={() => deleteWorkout(item.id)}
+                                        style={styles.deleteBtn}
+                                    >
+                                        <Ionicons name="trash-outline" size={18} color={theme.error} />
                                     </TouchableOpacity>
                                 </View>
 
@@ -511,12 +596,17 @@ export default function WorkoutScreen() {
                                         <Text style={styles.setColHeader}>WEIGHT</Text>
                                     </View>
                                     {item.sets.map((s, i) => (
-                                        <View key={i} style={[styles.setRow, i % 2 === 0 && styles.setRowAlt]}>
+                                        <View
+                                            key={i}
+                                            style={[styles.setRow, i % 2 === 0 && styles.setRowAlt]}
+                                        >
                                             <View style={styles.setNumber}>
                                                 <Text style={styles.setNumberText}>{i + 1}</Text>
                                             </View>
                                             <Text style={styles.setCell}>{s.reps}</Text>
-                                            <Text style={styles.setCell}>{s.weight ? `${s.weight} kg` : '—'}</Text>
+                                            <Text style={styles.setCell}>
+                                                {s.weight ? `${s.weight} kg` : '—'}
+                                            </Text>
                                         </View>
                                     ))}
                                 </View>
@@ -532,8 +622,12 @@ export default function WorkoutScreen() {
                                     </View>
                                     {item.sets.some(s => s.weight) && (
                                         <View style={[styles.footerBadge, styles.footerBadgeGreen]}>
-                                            <Text style={[styles.footerBadgeText, { color: '#22C55E' }]}>
-                                                {Math.max(...item.sets.filter(s => s.weight).map(s => parseFloat(s.weight)))} kg max
+                                            <Text style={[styles.footerBadgeText, { color: theme.success }]}>
+                                                {Math.max(
+                                                    ...item.sets
+                                                        .filter(s => s.weight)
+                                                        .map(s => parseFloat(s.weight))
+                                                )} kg max
                                             </Text>
                                         </View>
                                     )}
@@ -541,10 +635,18 @@ export default function WorkoutScreen() {
                             </View>
                         ))}
 
-                        {/* Finish Workout Button */}
-                        <TouchableOpacity style={styles.finishBtn} onPress={finishWorkout} activeOpacity={0.85}>
-                            <Ionicons name="flag" size={20} color="#fff" />
-                            <Text style={styles.finishBtnText}>Finish Workout</Text>
+                        <TouchableOpacity
+                            style={styles.finishBtn}
+                            onPress={finishWorkout}
+                            activeOpacity={0.82}
+                        >
+                            <View style={styles.finishBtnInner}>
+                                <View style={styles.finishBtnIconWrap}>
+                                    <Ionicons name="flag" size={15} color="#FFFFFF" />
+                                </View>
+                                <Text style={styles.finishBtnText}>Finish Workout</Text>
+                                <Ionicons name="arrow-forward" size={15} color="rgba(255,255,255,0.9)" />
+                            </View>
                         </TouchableOpacity>
                     </View>
                 )}
@@ -556,122 +658,317 @@ export default function WorkoutScreen() {
                         <Text style={styles.emptyText}>Tap "Start Workout Session" to begin</Text>
                     </View>
                 )}
-
             </ScrollView>
         </KeyboardAvoidingView>
     );
 }
 
-const styles = StyleSheet.create({
-    container: { flex: 1, backgroundColor: '#F9FAFB' },
+const createStyles = (theme) => StyleSheet.create({
+    container: { flex: 1, backgroundColor: theme.background },
     scroll: { padding: 20, paddingBottom: 40 },
 
-    header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 20, marginBottom: 20 },
-    title: { fontSize: 26, fontWeight: 'bold', color: '#111827' },
-    subtitle: { fontSize: 14, color: '#9CA3AF', marginTop: 2 },
-    statsBadge: { backgroundColor: '#22C55E', borderRadius: 14, paddingHorizontal: 14, paddingVertical: 8, alignItems: 'center' },
-    statsNumber: { fontSize: 20, fontWeight: 'bold', color: '#fff' },
-    statsLabel: { fontSize: 10, color: '#fff', opacity: 0.85 },
-    timerBadge: { backgroundColor: '#111827', borderRadius: 14, paddingHorizontal: 14, paddingVertical: 8, flexDirection: 'row', alignItems: 'center', gap: 5 },
-    timerText: { fontSize: 15, fontWeight: 'bold', color: '#22C55E' },
+    header: {
+        flexDirection: 'row', justifyContent: 'space-between',
+        alignItems: 'center', marginTop: 20, marginBottom: 20,
+    },
+    title: { fontSize: 26, fontWeight: 'bold', color: theme.text },
+    subtitle: { fontSize: 14, color: theme.textTertiary, marginTop: 2 },
 
-    startBtn: { backgroundColor: '#22C55E', borderRadius: 16, padding: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, marginBottom: 20, shadowColor: '#22C55E', shadowOpacity: 0.35, shadowRadius: 10, elevation: 5 },
-    startBtnText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+    statsBadge: {
+        backgroundColor: theme.success, borderRadius: 14,
+        paddingHorizontal: 14, paddingVertical: 8, alignItems: 'center',
+    },
+    statsNumber: { fontSize: 20, fontWeight: 'bold', color: '#FFFFFF' },
+    statsLabel: { fontSize: 10, color: 'rgba(255,255,255,0.85)' },
 
-    statsRow: { backgroundColor: '#111827', borderRadius: 16, flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center', padding: 18, marginBottom: 20 },
+    timerBadge: {
+        backgroundColor: theme.primary, borderRadius: 14,
+        paddingHorizontal: 14, paddingVertical: 8,
+        flexDirection: 'row', alignItems: 'center', gap: 5,
+    },
+    timerText: { fontSize: 15, fontWeight: 'bold', color: '#FFFFFF' },
+
+    startBtn: {
+        borderRadius: 18, marginBottom: 20, overflow: 'hidden',
+        backgroundColor: theme.success,
+        shadowColor: theme.success, shadowOpacity: 0.45, shadowRadius: 16,
+        shadowOffset: { width: 0, height: 6 }, elevation: 6,
+    },
+    startBtnInner: {
+        flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+        gap: 10, paddingVertical: 15, paddingHorizontal: 24,
+        backgroundColor: 'rgba(0,0,0,0.15)',
+    },
+    startBtnIconWrap: {
+        width: 26, height: 26, borderRadius: 8,
+        backgroundColor: 'rgba(0,0,0,0.2)',
+        alignItems: 'center', justifyContent: 'center',
+    },
+    startBtnText: {
+        fontSize: 16, fontWeight: '700', color: '#FFFFFF',
+        flex: 1, textAlign: 'center',
+    },
+
+    statsRow: {
+        backgroundColor: theme.surfaceAlt, borderRadius: 16,
+        flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center',
+        padding: 18, marginBottom: 20,
+        borderWidth: 1, borderColor: theme.border,
+    },
     statBox: { alignItems: 'center' },
-    statValue: { fontSize: 22, fontWeight: 'bold', color: '#22C55E' },
-    statLabel: { fontSize: 11, color: '#9CA3AF', marginTop: 2 },
-    statDivider: { width: 1, height: 30, backgroundColor: '#374151' },
+    statValue: { fontSize: 22, fontWeight: 'bold', color: theme.success },
+    statLabel: { fontSize: 11, color: theme.textTertiary, marginTop: 2 },
+    statDivider: { width: 1, height: 30, backgroundColor: theme.border },
 
-    previousBanner: { backgroundColor: '#EFF6FF', borderRadius: 16, padding: 14, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, borderWidth: 1, borderColor: '#BFDBFE' },
+    previousBanner: {
+        backgroundColor: theme.infoLight, borderRadius: 16, padding: 14,
+        flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+        marginBottom: 12, borderWidth: 1, borderColor: theme.info,
+    },
     previousBannerLeft: { flexDirection: 'row', alignItems: 'center' },
-    previousBannerTitle: { fontSize: 13, fontWeight: '700', color: '#1D4ED8' },
-    previousBannerDate: { fontSize: 11, color: '#3B82F6', marginTop: 1 },
+    previousBannerTitle: { fontSize: 13, fontWeight: '700', color: theme.info },
+    previousBannerDate: { fontSize: 11, color: theme.info, marginTop: 1, opacity: 0.8 },
     previousBannerRight: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-    previousBannerCount: { fontSize: 12, fontWeight: '600', color: '#3B82F6' },
+    previousBannerCount: { fontSize: 12, fontWeight: '600', color: theme.info },
 
-    previousList: { backgroundColor: '#F8FAFF', borderRadius: 16, padding: 14, marginBottom: 16, borderWidth: 1, borderColor: '#BFDBFE' },
-    previousListHint: { fontSize: 12, color: '#6B7280', marginBottom: 12, fontStyle: 'italic' },
-    previousItem: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#fff', borderRadius: 12, padding: 12, marginBottom: 8, borderWidth: 1, borderColor: '#E5E7EB' },
+    previousList: {
+        backgroundColor: theme.infoLight, borderRadius: 16, padding: 14,
+        marginBottom: 16, borderWidth: 1, borderColor: theme.border,
+    },
+    previousListHint: {
+        fontSize: 12, color: theme.textSecondary, marginBottom: 12, fontStyle: 'italic',
+    },
+    previousItem: {
+        flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+        backgroundColor: theme.surface, borderRadius: 12, padding: 12,
+        marginBottom: 8, borderWidth: 1, borderColor: theme.border,
+    },
     previousItemLeft: { flex: 1 },
-    previousItemName: { fontSize: 14, fontWeight: '700', color: '#111827', textTransform: 'capitalize', marginBottom: 3 },
-    previousItemMeta: { fontSize: 12, color: '#6B7280' },
-    loadBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#EFF6FF', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
-    loadBtnText: { fontSize: 12, fontWeight: '700', color: '#3B82F6' },
+    previousItemName: {
+        fontSize: 14, fontWeight: '700', color: theme.text,
+        textTransform: 'capitalize', marginBottom: 3,
+    },
+    previousItemMeta: { fontSize: 12, color: theme.textSecondary },
+    loadBtn: {
+        flexDirection: 'row', alignItems: 'center', gap: 4,
+        backgroundColor: theme.infoLight, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8,
+    },
+    loadBtnText: { fontSize: 12, fontWeight: '700', color: theme.info },
 
-    inputCard: { backgroundColor: '#FFFFFF', borderRadius: 20, padding: 20, marginBottom: 24, shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 10, elevation: 4 },
-    inputCardTitle: { fontSize: 16, fontWeight: '700', color: '#111827', marginBottom: 14 },
-    input: { backgroundColor: '#F3F4F6', padding: 14, borderRadius: 12, fontSize: 15, color: '#111827', marginBottom: 16 },
+    inputCard: {
+        backgroundColor: theme.surface, borderRadius: 20, padding: 20, marginBottom: 24,
+        shadowColor: theme.shadowColor, shadowOpacity: 0.05, shadowRadius: 10, elevation: 4,
+    },
+    inputCardTitle: { fontSize: 16, fontWeight: '700', color: theme.text, marginBottom: 14 },
+    input: {
+        backgroundColor: theme.background, padding: 14, borderRadius: 12,
+        fontSize: 15, color: theme.text, marginBottom: 16,
+        borderWidth: 1, borderColor: theme.border,
+    },
 
-    setsPreview: { backgroundColor: '#F9FAFB', borderRadius: 12, padding: 10, marginBottom: 16 },
+    setsPreview: {
+        backgroundColor: theme.background, borderRadius: 12, padding: 10, marginBottom: 16,
+    },
     setsPreviewHeader: { flexDirection: 'row', paddingHorizontal: 4, marginBottom: 6 },
-    setsPreviewCol: { flex: 1, fontSize: 10, fontWeight: '700', color: '#9CA3AF', letterSpacing: 0.8, textAlign: 'center' },
-    setsPreviewRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 7, borderRadius: 8, paddingHorizontal: 4 },
-    setsPreviewRowAlt: { backgroundColor: '#F3F4F6' },
-    setsPreviewCell: { flex: 1, textAlign: 'center', fontSize: 14, fontWeight: '600', color: '#111827' },
+    setsPreviewCol: {
+        flex: 1, fontSize: 10, fontWeight: '700', color: theme.textTertiary,
+        letterSpacing: 0.8, textAlign: 'center',
+    },
+    setsPreviewRow: {
+        flexDirection: 'row', alignItems: 'center',
+        paddingVertical: 7, borderRadius: 8, paddingHorizontal: 4,
+    },
+    setsPreviewRowAlt: { backgroundColor: theme.divider },
+    setsPreviewCell: {
+        flex: 1, textAlign: 'center', fontSize: 14, fontWeight: '600', color: theme.text,
+    },
     setBadge: { flex: 1, alignItems: 'center' },
-    setBadgeText: { width: 24, height: 24, borderRadius: 8, backgroundColor: '#E5E7EB', textAlign: 'center', lineHeight: 24, fontSize: 12, fontWeight: '700', color: '#374151', overflow: 'hidden' },
+    setBadgeText: {
+        width: 24, height: 24, borderRadius: 8, backgroundColor: theme.border,
+        textAlign: 'center', lineHeight: 24, fontSize: 12, fontWeight: '700',
+        color: theme.textSecondary, overflow: 'hidden',
+    },
 
-    inputLabel: { fontSize: 12, fontWeight: '700', color: '#374151', marginBottom: 8, letterSpacing: 0.5 },
+    inputLabel: {
+        fontSize: 12, fontWeight: '700', color: theme.textSecondary,
+        marginBottom: 8, letterSpacing: 0.5,
+    },
     inputRow: { flexDirection: 'row', gap: 10, marginBottom: 16, alignItems: 'flex-end' },
     inputGroupSmall: { flex: 1 },
-    inputSubLabel: { fontSize: 10, fontWeight: '700', color: '#9CA3AF', marginBottom: 6, letterSpacing: 0.8 },
-    inputSmall: { backgroundColor: '#F3F4F6', padding: 12, borderRadius: 12, fontSize: 16, color: '#111827', textAlign: 'center', fontWeight: '600' },
+    inputSubLabel: {
+        fontSize: 10, fontWeight: '700', color: theme.textTertiary,
+        marginBottom: 6, letterSpacing: 0.8,
+    },
+    inputSmall: {
+        backgroundColor: theme.background, padding: 12, borderRadius: 12,
+        fontSize: 16, color: theme.text, textAlign: 'center', fontWeight: '600',
+        borderWidth: 1, borderColor: theme.border,
+    },
 
-    addSetBtn: { flex: 1, backgroundColor: '#111827', borderRadius: 12, padding: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4 },
-    addSetBtnDisabled: { backgroundColor: '#E5E7EB' },
-    addSetBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
+    addSetBtn: {
+        flex: 1, borderRadius: 12, overflow: 'hidden',
+        backgroundColor: theme.primary,
+        shadowColor: theme.primary, shadowOpacity: 0.35, shadowRadius: 8,
+        shadowOffset: { width: 0, height: 4 }, elevation: 4,
+    },
+    addSetBtnDisabled: { backgroundColor: theme.border, shadowOpacity: 0, elevation: 0 },
+    addSetBtnInner: {
+        flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+        gap: 6, paddingVertical: 13, paddingHorizontal: 10,
+        backgroundColor: 'rgba(0,0,0,0.15)',
+    },
+    addSetBtnIconWrap: {
+        width: 20, height: 20, borderRadius: 6,
+        backgroundColor: 'rgba(0,0,0,0.2)',
+        alignItems: 'center', justifyContent: 'center',
+    },
+    addSetBtnText: { color: '#FFFFFF', fontWeight: '700', fontSize: 13 },
 
-    saveButton: { backgroundColor: '#22C55E', borderRadius: 14, padding: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, shadowColor: '#22C55E', shadowOpacity: 0.35, shadowRadius: 10, elevation: 5 },
-    saveButtonDisabled: { backgroundColor: '#D1FAE5', shadowOpacity: 0, elevation: 0 },
-    saveButtonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+    saveButton: {
+        borderRadius: 16, overflow: 'hidden',
+        backgroundColor: theme.success,
+        shadowColor: theme.success, shadowOpacity: 0.45, shadowRadius: 14,
+        shadowOffset: { width: 0, height: 6 }, elevation: 6,
+    },
+    saveButtonDisabled: { backgroundColor: theme.border, shadowOpacity: 0, elevation: 0 },
+    saveButtonInner: {
+        flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+        gap: 10, paddingVertical: 15, paddingHorizontal: 24,
+        backgroundColor: 'rgba(0,0,0,0.15)',
+    },
+    saveButtonIconWrap: {
+        width: 26, height: 26, borderRadius: 8,
+        backgroundColor: 'rgba(0,0,0,0.2)',
+        alignItems: 'center', justifyContent: 'center',
+    },
+    saveButtonText: {
+        color: '#FFFFFF', fontSize: 15, fontWeight: '700', flex: 1, textAlign: 'center',
+    },
 
-    sectionTitle: { fontSize: 18, fontWeight: '700', color: '#111827', marginBottom: 14 },
-    exerciseCard: { backgroundColor: '#FFFFFF', borderRadius: 20, marginBottom: 14, overflow: 'hidden', shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 10, elevation: 4 },
-    exerciseHeader: { flexDirection: 'row', alignItems: 'center', padding: 16, borderBottomWidth: 1, borderBottomColor: '#F3F4F6', gap: 12 },
-    exerciseIndexBadge: { width: 30, height: 30, borderRadius: 10, backgroundColor: '#111827', alignItems: 'center', justifyContent: 'center' },
-    exerciseIndex: { color: '#22C55E', fontWeight: 'bold', fontSize: 13 },
-    exerciseName: { flex: 1, fontSize: 16, fontWeight: '700', color: '#111827', textTransform: 'capitalize' },
+    sectionTitle: { fontSize: 18, fontWeight: '700', color: theme.text, marginBottom: 14 },
+    exerciseCard: {
+        backgroundColor: theme.surface, borderRadius: 20, marginBottom: 14, overflow: 'hidden',
+        shadowColor: theme.shadowColor, shadowOpacity: 0.05, shadowRadius: 10, elevation: 4,
+    },
+    exerciseHeader: {
+        flexDirection: 'row', alignItems: 'center', padding: 16,
+        borderBottomWidth: 1, borderBottomColor: theme.divider, gap: 12,
+    },
+    exerciseIndexBadge: {
+        width: 30, height: 30, borderRadius: 10,
+        backgroundColor: theme.primary, alignItems: 'center', justifyContent: 'center',
+    },
+    exerciseIndex: { color: '#FFFFFF', fontWeight: 'bold', fontSize: 13 },
+    exerciseName: {
+        flex: 1, fontSize: 16, fontWeight: '700', color: theme.text, textTransform: 'capitalize',
+    },
     deleteBtn: { padding: 4 },
-    setGrid: { paddingHorizontal: 16, paddingTop: 8 },
-    setRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderRadius: 8, paddingHorizontal: 4 },
-    setRowAlt: { backgroundColor: '#F9FAFB' },
-    setColHeader: { flex: 1, fontSize: 10, fontWeight: '700', color: '#9CA3AF', letterSpacing: 0.8, textAlign: 'center' },
-    setNumber: { flex: 1, alignItems: 'center' },
-    setNumberText: { width: 24, height: 24, borderRadius: 8, backgroundColor: '#F3F4F6', textAlign: 'center', lineHeight: 24, fontSize: 12, fontWeight: '700', color: '#374151', overflow: 'hidden' },
-    setCell: { flex: 1, textAlign: 'center', fontSize: 14, fontWeight: '600', color: '#111827' },
-    exerciseFooter: { flexDirection: 'row', gap: 8, padding: 14, paddingTop: 10 },
-    footerBadge: { backgroundColor: '#F3F4F6', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 5 },
-    footerBadgeGreen: { backgroundColor: '#DCFCE7' },
-    footerBadgeText: { fontSize: 12, fontWeight: '600', color: '#374151' },
 
-    finishBtn: { backgroundColor: '#EF4444', borderRadius: 16, padding: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, marginTop: 6, shadowColor: '#EF4444', shadowOpacity: 0.35, shadowRadius: 10, elevation: 5 },
-    finishBtnText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+    setGrid: { paddingHorizontal: 16, paddingTop: 8 },
+    setRow: {
+        flexDirection: 'row', alignItems: 'center',
+        paddingVertical: 8, borderRadius: 8, paddingHorizontal: 4,
+    },
+    setRowAlt: { backgroundColor: theme.background },
+    setColHeader: {
+        flex: 1, fontSize: 10, fontWeight: '700', color: theme.textTertiary,
+        letterSpacing: 0.8, textAlign: 'center',
+    },
+    setNumber: { flex: 1, alignItems: 'center' },
+    setNumberText: {
+        width: 24, height: 24, borderRadius: 8, backgroundColor: theme.divider,
+        textAlign: 'center', lineHeight: 24, fontSize: 12, fontWeight: '700',
+        color: theme.textSecondary, overflow: 'hidden',
+    },
+    setCell: { flex: 1, textAlign: 'center', fontSize: 14, fontWeight: '600', color: theme.text },
+
+    exerciseFooter: { flexDirection: 'row', gap: 8, padding: 14, paddingTop: 10 },
+    footerBadge: {
+        backgroundColor: theme.divider, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 5,
+    },
+    footerBadgeGreen: { backgroundColor: theme.successLight },
+    footerBadgeText: { fontSize: 12, fontWeight: '600', color: theme.textSecondary },
+
+    finishBtn: {
+        borderRadius: 18, marginTop: 6, overflow: 'hidden',
+        backgroundColor: theme.error,
+        shadowColor: theme.error, shadowOpacity: 0.45, shadowRadius: 16,
+        shadowOffset: { width: 0, height: 6 }, elevation: 6,
+    },
+    finishBtnInner: {
+        flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+        gap: 10, paddingVertical: 15, paddingHorizontal: 24,
+        backgroundColor: 'rgba(0,0,0,0.15)',
+    },
+    finishBtnIconWrap: {
+        width: 26, height: 26, borderRadius: 8,
+        backgroundColor: 'rgba(0,0,0,0.2)',
+        alignItems: 'center', justifyContent: 'center',
+    },
+    finishBtnText: {
+        color: '#FFFFFF', fontSize: 16, fontWeight: '700', flex: 1, textAlign: 'center',
+    },
 
     emptyState: { alignItems: 'center', paddingVertical: 50 },
     emptyIcon: { fontSize: 48, marginBottom: 14 },
-    emptyTitle: { fontSize: 18, fontWeight: '700', color: '#111827', marginBottom: 6 },
-    emptyText: { fontSize: 14, color: '#9CA3AF', textAlign: 'center' },
+    emptyTitle: { fontSize: 18, fontWeight: '700', color: theme.text, marginBottom: 6 },
+    emptyText: { fontSize: 14, color: theme.textTertiary, textAlign: 'center' },
 
-    // Modal
-    modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 20 },
-    modalCard: { backgroundColor: '#fff', borderRadius: 24, padding: 28, width: '100%', alignItems: 'center' },
+    modalOverlay: {
+        flex: 1, backgroundColor: 'rgba(0,0,0,0.6)',
+        justifyContent: 'center', alignItems: 'center', padding: 20,
+    },
+    modalCard: {
+        backgroundColor: theme.surface, borderRadius: 24, padding: 28,
+        width: '100%', alignItems: 'center',
+    },
     modalEmoji: { fontSize: 48, marginBottom: 8 },
-    modalTitle: { fontSize: 24, fontWeight: 'bold', color: '#111827', marginBottom: 4 },
-    modalDate: { fontSize: 13, color: '#9CA3AF', marginBottom: 20 },
-    summaryGrid: { flexDirection: 'row', backgroundColor: '#111827', borderRadius: 16, padding: 18, width: '100%', justifyContent: 'space-around', marginBottom: 16 },
+    modalTitle: { fontSize: 24, fontWeight: 'bold', color: theme.text, marginBottom: 4 },
+    modalDate: { fontSize: 13, color: theme.textTertiary, marginBottom: 20 },
+
+    summaryGrid: {
+        flexDirection: 'row', backgroundColor: theme.surfaceAlt, borderRadius: 16,
+        padding: 18, width: '100%', justifyContent: 'space-around', marginBottom: 16,
+        borderWidth: 1, borderColor: theme.border,
+    },
     summaryCell: { alignItems: 'center' },
-    summaryCellValue: { fontSize: 18, fontWeight: 'bold', color: '#22C55E' },
-    summaryCellLabel: { fontSize: 11, color: '#9CA3AF', marginTop: 2 },
-    summaryCellDivider: { width: 1, backgroundColor: '#374151' },
-    volumeBox: { backgroundColor: '#F3F4F6', borderRadius: 14, padding: 16, width: '100%', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
-    volumeLabel: { fontSize: 14, color: '#6B7280', fontWeight: '600' },
-    volumeValue: { fontSize: 20, fontWeight: 'bold', color: '#111827' },
-    prBox: { backgroundColor: '#FFFBEB', borderRadius: 14, padding: 14, width: '100%', marginBottom: 16, borderWidth: 1, borderColor: '#FDE68A' },
-    prTitle: { fontSize: 14, fontWeight: '700', color: '#92400E', marginBottom: 8 },
+    summaryCellValue: { fontSize: 18, fontWeight: 'bold', color: theme.success },
+    summaryCellLabel: { fontSize: 11, color: theme.textTertiary, marginTop: 2 },
+    summaryCellDivider: { width: 1, backgroundColor: theme.border },
+
+    volumeBox: {
+        backgroundColor: theme.background, borderRadius: 14, padding: 16,
+        width: '100%', flexDirection: 'row', justifyContent: 'space-between',
+        alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: theme.border,
+    },
+    volumeLabel: { fontSize: 14, color: theme.textSecondary, fontWeight: '600' },
+    volumeValue: { fontSize: 20, fontWeight: 'bold', color: theme.text },
+
+    prBox: {
+        backgroundColor: theme.warningLight, borderRadius: 14, padding: 14,
+        width: '100%', marginBottom: 16, borderWidth: 1, borderColor: theme.warning,
+    },
+    prTitle: { fontSize: 14, fontWeight: '700', color: theme.text, marginBottom: 8 },
     prItem: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 4 },
-    prText: { fontSize: 13, color: '#92400E', fontWeight: '600' },
-    modalBtn: { backgroundColor: '#22C55E', borderRadius: 14, padding: 15, width: '100%', alignItems: 'center', shadowColor: '#22C55E', shadowOpacity: 0.35, shadowRadius: 10, elevation: 5 },
-    modalBtnText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+    prText: { fontSize: 13, color: theme.text, fontWeight: '600' },
+
+    modalBtn: {
+        borderRadius: 16, width: '100%', overflow: 'hidden',
+        backgroundColor: theme.success,
+        shadowColor: theme.success, shadowOpacity: 0.45, shadowRadius: 14,
+        shadowOffset: { width: 0, height: 6 }, elevation: 6,
+    },
+    modalBtnInner: {
+        flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+        gap: 10, paddingVertical: 15, paddingHorizontal: 24,
+        backgroundColor: 'rgba(0,0,0,0.15)',
+    },
+    modalBtnIconWrap: {
+        width: 26, height: 26, borderRadius: 8,
+        backgroundColor: 'rgba(0,0,0,0.2)',
+        alignItems: 'center', justifyContent: 'center',
+    },
+    modalBtnText: {
+        color: '#FFFFFF', fontSize: 16, fontWeight: '700', flex: 1, textAlign: 'center',
+    },
 });

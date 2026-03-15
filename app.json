@@ -1,14 +1,14 @@
 {
   "expo": {
-    "name": "GYM",
-    "slug": "GYM",
+    "name": "CaloMate",
+    "slug": "CaloMate",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/logo1.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/logo1.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
@@ -17,13 +17,29 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/logo1.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.ayoubblm.gym"
     },
     "web": {
-      "favicon": "./assets/favicon.png"
-    }
+      "favicon": "./assets/logo1.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "e27f5bb8-bcda-4702-a22c-b92690919c73"
+      }
+    },
+    "owner": "ayoubblm",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/e27f5bb8-bcda-4702-a22c-b92690919c73"
+    },
+    "plugins": [
+      "@react-native-community/datetimepicker",
+    ]
   }
 }
